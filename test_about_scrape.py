@@ -3,7 +3,6 @@ import requests
 import time
 import random
 import re
-from bs4 import BeautifulSoup
 import pandas as pd
 import sys
 from scrape_analytics import scrape_about_data_with_driver, create_driver

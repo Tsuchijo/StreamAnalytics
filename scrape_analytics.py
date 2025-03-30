@@ -31,7 +31,7 @@ headers = {
 # Base URL and parameters
 base_url = "https://sullygnome.com/api/tables/channeltables/getchannels/7/0/1/3/desc/"
 entries_per_page = 100
-total_entries = 200
+total_entries = 200  # Default value, can be modified by user
 
 # Create a global DataFrame to store all data
 df = pd.DataFrame()
@@ -42,9 +42,13 @@ about_scraping_in_progress = False
 df_lock = threading.Lock()
 
 # Function to scrape data
-def scrape_data():
-    global df, scraping_complete, scraping_in_progress
+def scrape_data(entries_to_scrape=None):
+    global df, scraping_complete, scraping_in_progress, total_entries
     
+    # Use custom entry count if provided
+    if entries_to_scrape is not None and entries_to_scrape > 0:
+        total_entries = entries_to_scrape
+        
     scraping_in_progress = True
     all_data = []
     
@@ -290,9 +294,23 @@ app.layout = html.Div([
     html.H1("Twitch Channel Data Scraper", style={'textAlign': 'center'}),
     
     html.Div([
+        # Add a text input for number of entries to scrape
+        html.Div([
+            html.Label("Number of entries to scrape:"),
+            dcc.Input(
+                id='entries-input',
+                type='number',
+                min=1,
+                step=1,
+                value=200,  # Default value
+                style={'marginLeft': '10px', 'width': '100px'}
+            )
+        ], style={'display': 'inline-block', 'marginRight': '20px'}),
+        
         html.Button('Start Scraping', id='scrape-button', n_clicks=0),
         html.Button('Export CSV', id='export-button', n_clicks=0, style={'marginLeft': '20px'}),
         html.Button('Scrape About Data', id='scrape-about-button', n_clicks=0, style={'marginLeft': '20px'}),
+        html.Button('Select All Filtered', id='select-all-button', n_clicks=0, style={'marginLeft': '20px'}),
         dcc.Download(id="download-dataframe-csv"),
         html.Div(id='scraping-status', style={'marginLeft': '20px', 'display': 'inline-block'})
     ], style={'textAlign': 'center', 'margin': '20px'}),
@@ -304,6 +322,9 @@ app.layout = html.Div([
             n_intervals=0
         ),
         
+        # Hidden div to store filtered indices
+        html.Div(id='filtered-indices', style={'display': 'none'}),
+        
         dash_table.DataTable(
             id='data-table',
             columns=[],
@@ -314,7 +335,9 @@ app.layout = html.Div([
             sort_mode='multi',        # Allow sorting by multiple columns
             filter_action='native',   # Enable filtering
             row_selectable='multi',   # Allow selecting multiple rows
-            selected_rows=[]          # No rows selected by default
+            selected_rows=[],         # No rows selected by default
+            # Add derived_filter_query_structure to capture filter state
+            derived_filter_query_structure={}
         ),
     ]),
     
@@ -325,6 +348,34 @@ app.layout = html.Div([
 
 # Add a global variable to track about page scraping requests
 about_scrape_request_id = 0
+
+# New callback to handle the select all button
+@app.callback(
+    Output('data-table', 'selected_rows'),
+    [Input('select-all-button', 'n_clicks')],
+    [State('data-table', 'derived_virtual_data'),
+     State('data-table', 'derived_virtual_indices')]
+)
+def select_all_filtered_rows(n_clicks, filtered_data, filtered_indices):
+    if n_clicks == 0:
+        # Initial load, don't select anything
+        return []
+    
+    # Check if context was triggered by select-all button
+    ctx = dash.callback_context
+    if not ctx.triggered or ctx.triggered[0]['prop_id'] != 'select-all-button.n_clicks':
+        return dash.no_update
+        
+    # If there's filtered data, return those indices
+    if filtered_indices is not None:
+        return filtered_indices
+    
+    # If no filtered data but we have rows, select all rows
+    if filtered_data is not None:
+        return list(range(len(filtered_data)))
+    
+    # Default - empty selection
+    return []
 
 # Callback to handle About page scraping button
 @app.callback(
@@ -393,14 +444,21 @@ def update_table(n):
 @app.callback(
     Output('scraping-status', 'children'),
     [Input('scrape-button', 'n_clicks'),
-     Input('interval-component', 'n_intervals')]
+     Input('interval-component', 'n_intervals')],
+    [State('entries-input', 'value')]
 )
-def handle_scraping(n_clicks, n_intervals):
+def handle_scraping(n_clicks, n_intervals, entries_value):
     global scraping_in_progress
     
     # Start scraping if button is clicked and not already scraping
     if n_clicks > 0 and not scraping_in_progress and not scraping_complete:
-        threading.Thread(target=scrape_data).start()
+        # Use the value from the entries input box
+        try:
+            entries_to_scrape = int(entries_value) if entries_value else 200
+            threading.Thread(target=scrape_data, args=(entries_to_scrape,)).start()
+        except ValueError:
+            # If there's an error with the input, use the default
+            threading.Thread(target=scrape_data).start()
     
     # Return status message
     if scraping_complete:
