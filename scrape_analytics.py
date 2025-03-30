@@ -11,8 +11,11 @@ import flask
 import os
 from datetime import datetime
 import re 
-from bs4 import BeautifulSoup
-from requests_html import HTMLSession
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
 # Browser-like headers
@@ -34,7 +37,7 @@ total_entries = 200
 df = pd.DataFrame()
 scraping_complete = False
 scraping_in_progress = False
-
+about_scraping_in_progress = False
 # Create a lock for thread-safe DataFrame updates
 df_lock = threading.Lock()
 
@@ -116,92 +119,104 @@ def scrape_data():
     scraping_complete = True
     scraping_in_progress = False
 
+# Create a single driver to be reused
+def create_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    # Add additional options for stability
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
 
-def scrape_about_data(profile_name, debug_output=False):
-    # Create a session
-    session = HTMLSession()
-    
-    # Construct the about page URL
-    about_url = f"https://www.twitch.tv/{profile_name}/about"
-    
-    print(f"Fetching about page for {profile_name}...")
-    
-    # Dictionary to store contact information
-    contact_info = {
-        'email': None,
-        'discord': None,
-        'twitter': None,
-        'youtube': None
-    }
-    
+def scrape_about_data_with_driver(driver, profile_name, debug_output=False):
+    """Scrape a single profile using an existing driver instance"""
     try:
-        # Get the page
-        response = session.get(about_url)
+        # Construct the about page URL
+        about_url = f"https://www.twitch.tv/{profile_name}/about"
         
-        # Render the JavaScript (this is what makes it wait for the page to load)
-        response.html.render(sleep=3, timeout=15)
+        print(f"Fetching about page for {profile_name}...")
         
+        # Dictionary to store contact information
+        contact_info = {
+            'email': None,
+            'discord': None,
+            'twitter': None,
+            'youtube': None
+        }
+        
+        # Load the page
+        driver.get(about_url)
+        
+        # Wait for the page to load
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-a-target='channel-about-panel']"))
+            )
+            # Extra wait for JavaScript to finish
+            time.sleep(2)
+        except:
+            print(f"Timeout waiting for page to load for {profile_name}")
+        
+        # Save debug output if requested
         if debug_output:
-            html_content = response.html.html
+            html_content = driver.page_source
             html_folder = "debug"
-            # Create the folder if it doesn't exist
             if not os.path.exists(html_folder):
                 os.makedirs(html_folder)
             
-            # Save the HTML to a file
             file_path = os.path.join(html_folder, f"{profile_name}_about.html")
             with open(file_path, 'w', encoding='utf-8') as file:
                 file.write(html_content)
             print(f"Saved HTML to {file_path}")
         
-        # Find all links on the page
-        links = response.html.links
+        # Find all links
+        links = driver.find_elements(By.TAG_NAME, 'a')
         
-        # Process each link to extract contact information
-        for href in links:
-            href_lower = href.lower()
-            
-            # Extract email
-            if 'mailto:' in href_lower:
-                contact_info['email'] = href_lower.replace('mailto:', '').strip()
-            
-            # Extract Discord
-            elif 'discord' in href_lower:
-                contact_info['discord'] = href
-            
-            # Extract Twitter
-            elif 'twitter.com' in href_lower or 'x.com' in href_lower:
-                contact_info['twitter'] = href
-            
-            # Extract YouTube
-            elif 'youtube.com' in href_lower:
-                contact_info['youtube'] = href
+        for link in links:
+            try:
+                href = link.get_attribute('href')
+                if not href:
+                    continue
+                    
+                href_lower = href.lower()
+                
+                # Extract contact information
+                if 'mailto:' in href_lower:
+                    contact_info['email'] = href_lower.replace('mailto:', '').strip()
+                elif 'discord' in href_lower:
+                    contact_info['discord'] = href
+                elif 'twitter.com' in href_lower or 'x.com' in href_lower:
+                    contact_info['twitter'] = href
+                elif 'youtube.com' in href_lower:
+                    contact_info['youtube'] = href
+            except:
+                continue
         
-        # Look for email patterns in text
-        html_text = response.html.text
+        # Extract additional information from text
+        page_text = driver.page_source
+        
+        # Look for email patterns
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        email_matches = re.findall(email_pattern, html_text)
+        email_matches = re.findall(email_pattern, page_text)
         if email_matches and not contact_info['email']:
             contact_info['email'] = email_matches[0]
         
         # Look for Discord handles
         discord_pattern = r'[A-Za-z0-9_]+#\d{4}'
-        discord_matches = re.findall(discord_pattern, html_text)
+        discord_matches = re.findall(discord_pattern, page_text)
         if discord_matches and not contact_info['discord']:
             contact_info['discord'] = discord_matches[0]
+            
+        return contact_info
         
     except Exception as e:
         print(f"Error fetching about page for {profile_name}: {e}")
-    
-    finally:
-        session.close()
-        
-    return contact_info
+        return contact_info
 
-# Global variable to track "About" scraping status
-about_scraping_in_progress = False
 
-# Function to scrape about data for multiple channels
+# Update the multiple profile scraping function to use a single driver
 def scrape_multiple_about_data(profile_names):
     global df, about_scraping_in_progress
     
@@ -209,43 +224,62 @@ def scrape_multiple_about_data(profile_names):
     total = len(profile_names)
     processed = 0
     
-    # Copy the DataFrame to avoid modifying during iteration
-    with df_lock:
-        temp_df = df.copy()
-    
-    # Add columns for contact info if they don't exist
-    for col in ['email', 'discord', 'twitter', 'youtube']:
-        if col not in temp_df.columns:
-            temp_df[col] = None
-    
-    # Process each selected channel
-    for profile_name in profile_names:
-        # Get the profile name without the full URL
-        clean_name = profile_name
-        if '/' in profile_name:
-            clean_name = profile_name.split('/')[-1]
+    # Create a single driver to reuse
+    try:
+        driver = create_driver()
         
-        # Scrape the about data
-        contact_info = scrape_about_data(clean_name)
-        print(contact_info)
-        # Update the DataFrame with the new contact information
-        idx = temp_df.index[temp_df['twitchurl'] == profile_name].tolist()
-        if idx:
-            for key, value in contact_info.items():
-                temp_df.at[idx[0], key] = value
+        # Copy the DataFrame to avoid modifying during iteration
+        with df_lock:
+            temp_df = df.copy()
         
-        processed += 1
-        print(f"Processed {processed}/{total} channels")
+        # Add columns for contact info if they don't exist
+        for col in ['email', 'discord', 'twitter', 'youtube']:
+            if col not in temp_df.columns:
+                temp_df[col] = None
+        
+        # Process each selected channel
+        for profile_name in profile_names:
+            # Get the profile name without the full URL
+            clean_name = profile_name
+            if '/' in profile_name:
+                clean_name = profile_name.split('/')[-1]
+            
+            # Scrape the about data using the shared driver
+            contact_info = scrape_about_data_with_driver(driver, clean_name)
+            print(contact_info)
+            
+            # Update the DataFrame with the new contact information
+            idx = temp_df.index[temp_df['twitchurl'] == profile_name].tolist()
+            if idx:
+                for key, value in contact_info.items():
+                    temp_df.at[idx[0], key] = value
+            
+            processed += 1
+            print(f"Processed {processed}/{total} channels")
+            
+            # Add a small delay between requests to avoid getting rate limited
+            if processed < total:
+                delay = 1 + random.random() * 2  # Random delay between 1-3 seconds
+                time.sleep(delay)
+        
+        # Update the global DataFrame with thread safety
+        with df_lock:
+            df = temp_df
+            # Save the updated DataFrame to CSV
+            df.to_csv('twitch_channel_data_with_contacts.csv', index=False)
     
-    # Update the global DataFrame with thread safety
-    with df_lock:
-        df = temp_df
-        # Save the updated DataFrame to CSV
-        df.to_csv('twitch_channel_data_with_contacts.csv', index=False)
+    except Exception as e:
+        print(f"Error in scraping process: {e}")
     
-    about_scraping_in_progress = False
-    print("About page scraping complete!")
-
+    finally:
+        # Close the driver when done with all profiles
+        try:
+            driver.quit()
+        except:
+            pass
+        
+        about_scraping_in_progress = False
+        print("About page scraping complete!")
 
 # Initialize the Flask server
 server = flask.Flask(__name__)
