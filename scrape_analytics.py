@@ -10,6 +10,10 @@ from dash.dependencies import Input, Output, State
 import flask
 import os
 from datetime import datetime
+import re 
+from bs4 import BeautifulSoup
+from requests_html import HTMLSession
+
 
 # Browser-like headers
 headers = {
@@ -24,7 +28,7 @@ headers = {
 # Base URL and parameters
 base_url = "https://sullygnome.com/api/tables/channeltables/getchannels/7/0/1/3/desc/"
 entries_per_page = 100
-total_entries = 5000
+total_entries = 200
 
 # Create a global DataFrame to store all data
 df = pd.DataFrame()
@@ -112,17 +116,149 @@ def scrape_data():
     scraping_complete = True
     scraping_in_progress = False
 
+
+def scrape_about_data(profile_name, debug_output=False):
+    # Create a session
+    session = HTMLSession()
+    
+    # Construct the about page URL
+    about_url = f"https://www.twitch.tv/{profile_name}/about"
+    
+    print(f"Fetching about page for {profile_name}...")
+    
+    # Dictionary to store contact information
+    contact_info = {
+        'email': None,
+        'discord': None,
+        'twitter': None,
+        'youtube': None
+    }
+    
+    try:
+        # Get the page
+        response = session.get(about_url)
+        
+        # Render the JavaScript (this is what makes it wait for the page to load)
+        response.html.render(sleep=3, timeout=15)
+        
+        if debug_output:
+            html_content = response.html.html
+            html_folder = "debug"
+            # Create the folder if it doesn't exist
+            if not os.path.exists(html_folder):
+                os.makedirs(html_folder)
+            
+            # Save the HTML to a file
+            file_path = os.path.join(html_folder, f"{profile_name}_about.html")
+            with open(file_path, 'w', encoding='utf-8') as file:
+                file.write(html_content)
+            print(f"Saved HTML to {file_path}")
+        
+        # Find all links on the page
+        links = response.html.links
+        
+        # Process each link to extract contact information
+        for href in links:
+            href_lower = href.lower()
+            
+            # Extract email
+            if 'mailto:' in href_lower:
+                contact_info['email'] = href_lower.replace('mailto:', '').strip()
+            
+            # Extract Discord
+            elif 'discord' in href_lower:
+                contact_info['discord'] = href
+            
+            # Extract Twitter
+            elif 'twitter.com' in href_lower or 'x.com' in href_lower:
+                contact_info['twitter'] = href
+            
+            # Extract YouTube
+            elif 'youtube.com' in href_lower:
+                contact_info['youtube'] = href
+        
+        # Look for email patterns in text
+        html_text = response.html.text
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        email_matches = re.findall(email_pattern, html_text)
+        if email_matches and not contact_info['email']:
+            contact_info['email'] = email_matches[0]
+        
+        # Look for Discord handles
+        discord_pattern = r'[A-Za-z0-9_]+#\d{4}'
+        discord_matches = re.findall(discord_pattern, html_text)
+        if discord_matches and not contact_info['discord']:
+            contact_info['discord'] = discord_matches[0]
+        
+    except Exception as e:
+        print(f"Error fetching about page for {profile_name}: {e}")
+    
+    finally:
+        session.close()
+        
+    return contact_info
+
+# Global variable to track "About" scraping status
+about_scraping_in_progress = False
+
+# Function to scrape about data for multiple channels
+def scrape_multiple_about_data(profile_names):
+    global df, about_scraping_in_progress
+    
+    about_scraping_in_progress = True
+    total = len(profile_names)
+    processed = 0
+    
+    # Copy the DataFrame to avoid modifying during iteration
+    with df_lock:
+        temp_df = df.copy()
+    
+    # Add columns for contact info if they don't exist
+    for col in ['email', 'discord', 'twitter', 'youtube']:
+        if col not in temp_df.columns:
+            temp_df[col] = None
+    
+    # Process each selected channel
+    for profile_name in profile_names:
+        # Get the profile name without the full URL
+        clean_name = profile_name
+        if '/' in profile_name:
+            clean_name = profile_name.split('/')[-1]
+        
+        # Scrape the about data
+        contact_info = scrape_about_data(clean_name)
+        print(contact_info)
+        # Update the DataFrame with the new contact information
+        idx = temp_df.index[temp_df['twitchurl'] == profile_name].tolist()
+        if idx:
+            for key, value in contact_info.items():
+                temp_df.at[idx[0], key] = value
+        
+        processed += 1
+        print(f"Processed {processed}/{total} channels")
+    
+    # Update the global DataFrame with thread safety
+    with df_lock:
+        df = temp_df
+        # Save the updated DataFrame to CSV
+        df.to_csv('twitch_channel_data_with_contacts.csv', index=False)
+    
+    about_scraping_in_progress = False
+    print("About page scraping complete!")
+
+
 # Initialize the Flask server
 server = flask.Flask(__name__)
 app = dash.Dash(__name__, server=server)
 
-# Define the layout
+# App Layout 
 app.layout = html.Div([
     html.H1("Twitch Channel Data Scraper", style={'textAlign': 'center'}),
     
     html.Div([
         html.Button('Start Scraping', id='scrape-button', n_clicks=0),
         html.Button('Export CSV', id='export-button', n_clicks=0, style={'marginLeft': '20px'}),
+        html.Button('Scrape About Data', id='scrape-about-button', n_clicks=0, style={'marginLeft': '20px'}),
         dcc.Download(id="download-dataframe-csv"),
         html.Div(id='scraping-status', style={'marginLeft': '20px', 'display': 'inline-block'})
     ], style={'textAlign': 'center', 'margin': '20px'}),
@@ -140,12 +276,65 @@ app.layout = html.Div([
             data=[],
             page_size=20,
             style_table={'overflowX': 'auto'},
-            sort_action='native',  # Enable sorting
-            sort_mode='multi',     # Allow sorting by multiple columns
-            filter_action='native' # Enable filtering
+            sort_action='native',     # Enable sorting
+            sort_mode='multi',        # Allow sorting by multiple columns
+            filter_action='native',   # Enable filtering
+            row_selectable='multi',   # Allow selecting multiple rows
+            selected_rows=[]          # No rows selected by default
         ),
     ]),
+    
+    # Add status for About page scraping
+    html.Div(id='about-scraping-status', style={'margin': '20px', 'textAlign': 'center'})
 ])
+
+
+# Add a global variable to track about page scraping requests
+about_scrape_request_id = 0
+
+# Callback to handle About page scraping button
+@app.callback(
+    Output('about-scraping-status', 'children'),
+    [Input('scrape-about-button', 'n_clicks'),
+     Input('interval-component', 'n_intervals')],
+    [State('data-table', 'selected_rows'),
+     State('data-table', 'data')]
+)
+def handle_about_scraping(n_clicks, n_intervals, selected_rows, data):
+    global about_scraping_in_progress, about_scrape_request_id
+    
+    # Use context to determine which input triggered the callback
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Only start scraping if:
+    # 1. The button was clicked (not the interval)
+    # 2. We haven't already processed this exact click (using request_id)
+    # 3. We're not already scraping
+    # 4. Rows are selected
+    if (trigger_id == 'scrape-about-button' and 
+        n_clicks > about_scrape_request_id and 
+        not about_scraping_in_progress and 
+        selected_rows):
+        
+        # Update the request ID to match the current click count
+        about_scrape_request_id = n_clicks
+        
+        # Get the twitch URLs from the selected rows
+        profile_urls = [data[i]['twitchurl'] for i in selected_rows]
+        
+        # Start a thread to scrape the about data
+        threading.Thread(target=scrape_multiple_about_data, args=(profile_urls,)).start()
+    
+    # Return status message
+    if about_scraping_in_progress:
+        return "About page scraping in progress..."
+    elif n_clicks > 0 and not selected_rows and trigger_id == 'scrape-about-button':
+        return "Please select at least one channel before scraping About pages."
+    elif n_clicks > 0 and n_clicks == about_scrape_request_id and not about_scraping_in_progress:
+        return "About page scraping complete!"
+    else:
+        return "Select channels and click 'Scrape About Data' to gather contact information."
 
 # Callback to update the table
 @app.callback(
